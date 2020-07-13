@@ -151,6 +151,7 @@ VKAPI_ATTR VkResult VKAPI_CALL RPIFUNC(vkCreateInstance)(
 	//TODO ignored for now
 	//pCreateInfo->pApplicationInfo
 
+#if 0
 	{ //Simple check to make sure we only support RPi 0, 1, 2, 3
 		FILE* f = fopen("/proc/cpuinfo", "r");
 
@@ -181,6 +182,7 @@ VKAPI_ATTR VkResult VKAPI_CALL RPIFUNC(vkCreateInstance)(
 		free(str);
 	}
 
+#endif
 
 	//we assume we are on the RPi and the GPU exists...
 	int gpuExists = access( "/dev/dri/card0", F_OK ) != -1; assert(gpuExists);

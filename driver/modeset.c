@@ -6,6 +6,8 @@
 #include <pthread.h>
 #include <semaphore.h>
 
+static modeset_saved_state modeset_saved_states[32];
+
 typedef struct vsyncData
 {
 	_image* i;
@@ -14,7 +16,7 @@ typedef struct vsyncData
 	uint64_t seqno;
 } vsyncData;
 
-#define FLIP_FIFO_SIZE 2
+#define FLIP_FIFO_SIZE (2)
 
 static uint32_t refCount = 0;
 static pthread_t flipQueueThread = 0;
@@ -25,6 +27,339 @@ static sem_t flipQueueSem;
 
 static sem_t savedStateSem;
 
+#define VOID2U64(x) ((uint64_t)(unsigned long)(x))
+
+static int get_plane_id(int drm_fd, int crtc_index)
+{
+	drmModePlaneResPtr plane_resources;
+	uint32_t i, j;
+	int ret = -EINVAL;
+	int found_primary = 0;
+
+	plane_resources = drmModeGetPlaneResources(drm_fd);
+	if (!plane_resources) {
+		printf("drmModeGetPlaneResources failed: %s\n", strerror(errno));
+		return -1;
+	}
+
+	for (i = 0; (i < plane_resources->count_planes) && !found_primary; i++) {
+		uint32_t id = plane_resources->planes[i];
+		drmModePlanePtr plane = drmModeGetPlane(drm_fd, id);
+		if (!plane) {
+			printf("drmModeGetPlane(%u) failed: %s\n", id, strerror(errno));
+			continue;
+		}
+
+		if (plane->possible_crtcs & (1 << crtc_index)) {
+			drmModeObjectPropertiesPtr props =
+				drmModeObjectGetProperties(drm_fd, id, DRM_MODE_OBJECT_PLANE);
+
+			/* primary or not, this plane is good enough to use: */
+			ret = id;
+
+			for (j = 0; j < props->count_props; j++) {
+				drmModePropertyPtr p =
+					drmModeGetProperty(drm_fd, props->props[j]);
+
+				if ((strcmp(p->name, "type") == 0) &&
+						(props->prop_values[j] == DRM_PLANE_TYPE_PRIMARY)) {
+					/* found our primary plane, lets use that: */
+					found_primary = 1;
+				}
+				drmModeFreeProperty(p);
+			}
+			drmModeFreeObjectProperties(props);
+		}
+		drmModeFreePlane(plane);
+	}
+
+	drmModeFreePlaneResources(plane_resources);
+
+	return ret;
+}
+
+static int init_drm(struct drm *drm)
+{
+    drmModeRes *resources;
+    drmModeConnector *connector = NULL;
+    drmModeEncoder *encoder = NULL;
+    int i;
+
+    resources = drmModeGetResources(drm->fd);
+	if (resources == NULL) {
+        printf("could not get resources: %s\n", strerror(errno));
+		return -1;
+    }
+
+    /* find a connected connector: */
+	for (i = 0; i < resources->count_connectors; i++) {
+		connector = drmModeGetConnector(drm->fd, resources->connectors[i]);
+		if (connector->connection == DRM_MODE_CONNECTED) {
+			/* it's connected, let's use this! */
+			drm->connector_id = connector->connector_id;
+			break;
+		}
+		drmModeFreeConnector(connector);
+		connector = NULL;
+	}
+
+    if (!connector) {
+		/* we could be fancy and listen for hotplug events and wait for
+		 * a connector..
+		 */
+		printf("no connected connector!\n");
+		return -1;
+	}
+
+    printf("find a connect\n");
+
+    /* find preferred mode or the highest resolution mode: */
+	if (!drm->mode) {
+        int area;
+		for (i = 0, area = 0; i < connector->count_modes; i++) {
+			drmModeModeInfo *current_mode = &connector->modes[i];
+
+			if (current_mode->type & DRM_MODE_TYPE_PREFERRED) {
+				drm->mode = current_mode;
+				break;
+			}
+
+			int current_area = current_mode->hdisplay * current_mode->vdisplay;
+			if (current_area > area) {
+				drm->mode = current_mode;
+				area = current_area;
+			}
+		}
+	}
+
+    if (!drm->mode) {
+		printf("could not find mode!\n");
+		goto err;
+	}
+
+    printf("use mode:  %s %d %d %d %d %d %d %d %d %d %d\n",
+	       drm->mode->name,
+	       drm->mode->vrefresh,
+	       drm->mode->hdisplay,
+	       drm->mode->hsync_start,
+	       drm->mode->hsync_end,
+	       drm->mode->htotal,
+	       drm->mode->vdisplay,
+	       drm->mode->vsync_start,
+	       drm->mode->vsync_end,
+	       drm->mode->vtotal,
+	       drm->mode->clock);
+
+    /* find encoder: */
+	for (i = 0; i < resources->count_encoders; i++) {
+		encoder = drmModeGetEncoder(drm->fd, resources->encoders[i]);
+		if (encoder->encoder_id == connector->encoder_id)
+			break;
+		drmModeFreeEncoder(encoder);
+		encoder = NULL;
+	}
+
+	if (encoder) {
+		drm->crtc_id = encoder->crtc_id;
+		drmModeFreeEncoder(encoder);
+	} else {
+        printf("Can't get a encoder\n");
+		goto err;
+	}
+
+	for (i = 0; i < resources->count_crtcs; i++) {
+		if (resources->crtcs[i] == drm->crtc_id) {
+			drm->crtc_index = i;
+			break;
+		}
+	}
+
+	drm->plane_id = get_plane_id(drm->fd, drm->crtc_index);
+
+		/* We only do single plane to single crtc to single connector, no
+	 * fancy multi-monitor or multi-plane stuff.  So just grab the
+	 * plane/crtc/connector property info for one of each:
+	 */
+	drm->plane = calloc(1, sizeof(*drm->plane));
+	drm->crtc = calloc(1, sizeof(*drm->crtc));
+	drm->connector = calloc(1, sizeof(*drm->connector));
+
+#define get_resource(type, Type, id) do { 					\
+		drm->type->type = drmModeGet##Type(drm->fd, id);			\
+		if (!drm->type->type) {						\
+			printf("could not get %s %i: %s\n",			\
+					#type, id, strerror(errno));		\
+			return NULL;						\
+		}								\
+	} while (0)
+
+	get_resource(plane, Plane, drm->plane_id);
+	get_resource(crtc, Crtc, drm->crtc_id);
+	get_resource(connector, Connector, drm->connector_id);
+
+#define get_properties(type, TYPE, id) do {					\
+		uint32_t i;							\
+		drm->type->props = drmModeObjectGetProperties(drm->fd,		\
+				id, DRM_MODE_OBJECT_##TYPE);			\
+		if (!drm->type->props) {						\
+			printf("could not get %s %u properties: %s\n", 		\
+					#type, id, strerror(errno));		\
+			return NULL;						\
+		}								\
+		drm->type->props_info = calloc(drm->type->props->count_props,	\
+				sizeof(*drm->type->props_info));			\
+		for (i = 0; i < drm->type->props->count_props; i++) {		\
+			drm->type->props_info[i] = drmModeGetProperty(drm->fd,	\
+					drm->type->props->props[i]);		\
+		}								\
+	} while (0)
+
+	get_properties(plane, PLANE, drm->plane_id);
+	get_properties(crtc, CRTC, drm->crtc_id);
+	get_properties(connector, CONNECTOR, drm->connector_id);
+
+err:
+	// drmModeFreeConnector(connector);
+    drmModeFreeResources(resources);
+
+    return 0;
+}
+
+static int add_connector_property(struct drm *drm, drmModeAtomicReq *req, uint32_t obj_id,
+					const char *name, uint64_t value)
+{
+	struct connector *obj = drm->connector;
+	unsigned int i;
+	int prop_id = 0;
+
+	for (i = 0 ; i < obj->props->count_props ; i++) {
+		if (strcmp(obj->props_info[i]->name, name) == 0) {
+			prop_id = obj->props_info[i]->prop_id;
+			break;
+		}
+	}
+
+	if (prop_id < 0) {
+		printf("no connector property: %s\n", name);
+		return -EINVAL;
+	}
+
+	return drmModeAtomicAddProperty(req, obj_id, prop_id, value);
+}
+
+static int add_crtc_property(struct drm *drm, drmModeAtomicReq *req, uint32_t obj_id,
+				const char *name, uint64_t value)
+{
+	struct crtc *obj = drm->crtc;
+	unsigned int i;
+	int prop_id = -1;
+
+	for (i = 0 ; i < obj->props->count_props ; i++) {
+		if (strcmp(obj->props_info[i]->name, name) == 0) {
+			prop_id = obj->props_info[i]->prop_id;
+			break;
+		}
+	}
+
+	if (prop_id < 0) {
+		printf("no crtc property: %s\n", name);
+		return -EINVAL;
+	}
+
+	return drmModeAtomicAddProperty(req, obj_id, prop_id, value);
+}
+
+static int add_plane_property(struct drm *drm, drmModeAtomicReq *req, uint32_t obj_id,
+				const char *name, uint64_t value)
+{
+	struct plane *obj = drm->plane;
+	unsigned int i;
+	int prop_id = -1;
+
+	for (i = 0 ; i < obj->props->count_props ; i++) {
+		if (strcmp(obj->props_info[i]->name, name) == 0) {
+			prop_id = obj->props_info[i]->prop_id;
+			break;
+		}
+	}
+
+
+	if (prop_id < 0) {
+		printf("no plane property: %s\n", name);
+		return -EINVAL;
+	}
+
+	return drmModeAtomicAddProperty(req, obj_id, prop_id, value);
+}
+
+static int drm_atomic_commit(uint32_t fb_id, uint32_t flags, struct drm *drm, uint64_t user_data)
+{
+	drmModeAtomicReq *req;
+	uint32_t plane_id = drm->plane_id;
+	uint32_t blob_id;
+	int ret;
+
+	struct drm_event_vblank buf;
+
+	req = drmModeAtomicAlloc();
+
+	if (flags & DRM_MODE_ATOMIC_ALLOW_MODESET) {
+		if (add_connector_property(drm, req, drm->connector_id, "CRTC_ID",
+						drm->crtc_id) < 0)
+				return -1;
+
+		if (drmModeCreatePropertyBlob(drm->fd, drm->mode, sizeof(*drm->mode),
+					      &blob_id) != 0)
+			return -1;
+
+		if (add_crtc_property(drm, req, drm->crtc_id, "MODE_ID", blob_id) < 0)
+			return -1;
+
+		if (add_crtc_property(drm, req, drm->crtc_id, "ACTIVE", 1) < 0)
+			return -1;
+	}
+
+	add_plane_property(drm, req, plane_id, "FB_ID", fb_id);
+	add_plane_property(drm, req, plane_id, "CRTC_ID", drm->crtc_id);
+	add_plane_property(drm, req, plane_id, "SRC_X", 0);
+	add_plane_property(drm, req, plane_id, "SRC_Y", 0);
+	add_plane_property(drm, req, plane_id, "SRC_W", drm->mode->hdisplay << 16);
+	add_plane_property(drm, req, plane_id, "SRC_H", drm->mode->vdisplay << 16);
+	add_plane_property(drm, req, plane_id, "CRTC_X", 0);
+	add_plane_property(drm, req, plane_id, "CRTC_Y", 0);
+	add_plane_property(drm, req, plane_id, "CRTC_W", drm->mode->hdisplay);
+	add_plane_property(drm, req, plane_id, "CRTC_H", drm->mode->vdisplay);
+
+	if (drm->kms_in_fence_fd != -1) {
+		add_crtc_property(drm, req, drm->crtc_id, "OUT_FENCE_PTR",
+				VOID2U64(&drm->kms_out_fence_fd));
+		add_plane_property(drm, req, plane_id, "IN_FENCE_FD", drm->kms_in_fence_fd);
+	}
+
+	ret = drmModeAtomicCommit(drm->fd, req, flags, user_data);
+	if (ret)
+		goto out;
+
+	if (drm->kms_in_fence_fd != -1) {
+		close(drm->kms_in_fence_fd);
+		drm->kms_in_fence_fd = -1;
+	}
+
+	// ret = read(drm->fd, &buf, sizeof(buf));
+	// if(ret < 0 ) {
+	// 	printf("vblank read fail\n");
+	// } else {
+	// 	printf("vblank %u %u\n", buf.base.type, buf.base.length);
+	// }
+
+	// ret = 0;
+
+out:
+	drmModeAtomicFree(req);
+
+	return ret;
+}
+
 static void* flipQueueThreadFunction(void* vargp)
 {
 	uint32_t run = 1;
@@ -33,8 +368,6 @@ static void* flipQueueThreadFunction(void* vargp)
 
 	while(run)
 	{
-
-
 		uint64_t seqno = 0;
 
 		sem_wait(&flipQueueSem);
@@ -65,12 +398,30 @@ static void* flipQueueThreadFunction(void* vargp)
 					if(d->i->presentMode == VK_PRESENT_MODE_FIFO_KHR)
 					{
 						d->flipPending = 1;
+#ifdef DRM_ATOMIC_MODE_ENABLE
+						if(d->s->drm_atmoic.count == 0) {
+							drm_atomic_commit(d->i->fb, DRM_MODE_ATOMIC_NONBLOCK | DRM_MODE_PAGE_FLIP_EVENT | DRM_MODE_ATOMIC_ALLOW_MODESET, &d->s->drm_atmoic, (uint64_t)d);
+						} else {
+							drm_atomic_commit(d->i->fb, DRM_MODE_ATOMIC_NONBLOCK | DRM_MODE_PAGE_FLIP_EVENT, &d->s->drm_atmoic, (uint64_t)d);
+						}
+#else
 						drmModePageFlip(threadFD, d->s->crtc->crtc_id, d->i->fb, DRM_MODE_PAGE_FLIP_EVENT, d);
+#endif
 					}
 					else if(d->i->presentMode == VK_PRESENT_MODE_IMMEDIATE_KHR)
 					{
+#ifdef DRM_ATOMIC_MODE_ENABLE
+						if(d->s->drm_atmoic.count == 0) {
+							drm_atomic_commit(d->i->fb, DRM_MODE_ATOMIC_ALLOW_MODESET, &d->s->drm_atmoic, 0);
+						} else {
+							drm_atomic_commit(d->i->fb, 0, &d->s->drm_atmoic, 0);
+						}
+#else
 						drmModePageFlip(threadFD, d->s->crtc->crtc_id, d->i->fb, DRM_MODE_PAGE_FLIP_ASYNC, 0);
+#endif
 					}
+
+					// d->s->drm_atmoic.count++;
 				}
 				sem_post(&flipQueueSem);
 			}
@@ -87,21 +438,43 @@ void modeset_enum_displays(int fd, uint32_t* numDisplays, modeset_display* displ
 	 uint32_t tmpNumDisplays = 0;
 	 modeset_display tmpDisplays[16];
 
+#ifdef DRM_ATOMIC_MODE_ENABLE
+	 drmSetClientCap(fd, DRM_CLIENT_CAP_UNIVERSAL_PLANES, 1);
+	 drmSetClientCap(fd, DRM_CLIENT_CAP_ATOMIC, 1);
+#endif
+
 	 for(int c = 0; c < resPtr->count_connectors; ++c)
 	 {
 		 drmModeConnectorPtr connPtr = drmModeGetConnector(fd, resPtr->connectors[c]);
 
 		 if(connPtr->connection != DRM_MODE_CONNECTED)
 		 {
+			 drmModeFreeConnector(connPtr);
 			 continue; //skip unused connector
 		 }
 
 		 if(!connPtr->count_modes)
 		 {
+			 drmModeFreeConnector(connPtr);
 			 continue; //skip connectors with no valid modes
 		 }
 
-		 memcpy(tmpDisplays[tmpNumDisplays].name, connPtr->modes[0].name, 32);
+		//  memcpy(tmpDisplays[tmpNumDisplays].name, connPtr->modes[0].name, 32);
+
+		 switch (connPtr->connector_type)
+		 {
+		 case DRM_MODE_CONNECTOR_HDMIA:
+			 strcpy(tmpDisplays[tmpNumDisplays].name, "HDMI");
+			 break;
+		 case DRM_MODE_CONNECTOR_Composite:
+		 	 strcpy(tmpDisplays[tmpNumDisplays].name, "TV-OUT");
+			 break;
+		 case DRM_MODE_CONNECTOR_DSI:
+		 	 strcpy(tmpDisplays[tmpNumDisplays].name, "DSI");
+		 	 break;
+		 default:
+			 break;
+		 }
 
 		 tmpDisplays[tmpNumDisplays].mmWidth = connPtr->mmWidth;
 		 tmpDisplays[tmpNumDisplays].mmHeight = connPtr->mmHeight;
@@ -239,6 +612,29 @@ void modeset_enum_modes_for_display(int fd, uint32_t display, uint32_t* numModes
 	memcpy(modes, tmpModes, tmpNumModes * sizeof(modeset_display_mode));
 }
 
+void modeset_create_surface_for_atomic_mode(int fd, uint32_t display, uint32_t mode, modeset_display_surface* surface)
+{
+	if(!refCount)
+	{
+		flipQueueFifo = createFifo(dataMem, fifoMem, FLIP_FIFO_SIZE, sizeof(vsyncData));
+		pthread_create(&flipQueueThread, 0, flipQueueThreadFunction, &fd);
+		sem_init(&flipQueueSem, 0, 0);
+		sem_post(&flipQueueSem);
+
+		sem_init(&savedStateSem, 0, 0);
+		sem_post(&savedStateSem);
+	}
+
+	refCount++;
+
+	surface->drm_atmoic.kms_in_fence_fd = -1;
+	surface->drm_atmoic.fd = fd;
+	init_drm(&surface->drm_atmoic);
+
+	surface->modeID = mode;
+	surface->savedState = 0;
+}
+
 void modeset_create_surface_for_mode(int fd, uint32_t display, uint32_t mode, modeset_display_surface* surface)
 {
 //	modeset_debug_print(fd);
@@ -279,6 +675,14 @@ void modeset_create_surface_for_mode(int fd, uint32_t display, uint32_t mode, mo
 			surface->connector = connPtr;
 			surface->modeID = mode;
 			surface->crtc = drmModeGetCrtc(fd, encPtr->crtc_id);
+
+			// get plane ID that belong to crtc_id
+			for (int i = 0; i < resPtr->count_crtcs; i++) {
+				if (resPtr->crtcs[i] == encPtr->crtc_id) {
+					surface->plane_id = get_plane_id(fd, i);
+					break;
+				}
+			}
 
 			found = 1;
 		}
@@ -325,16 +729,77 @@ void modeset_create_surface_for_mode(int fd, uint32_t display, uint32_t mode, mo
 	//fprintf(stderr, "connector id %i, crtc id %i\n", connPtr->connector_id, encPtr->crtc_id);
 }
 
+uint32_t drm_mode_legacy_fb_format(uint32_t bpp, uint32_t depth)
+{
+	uint32_t fmt = 0;
+
+	switch (bpp) {
+	case 8:
+		if (depth == 8)
+			fmt = DRM_FORMAT_C8;
+		break;
+
+	case 16:
+		switch (depth) {
+		case 15:
+			fmt = DRM_FORMAT_XRGB1555;
+			break;
+		case 16:
+			fmt = DRM_FORMAT_RGB565;
+			break;
+		default:
+			break;
+		}
+		break;
+
+	case 24:
+		if (depth == 24)
+			fmt = DRM_FORMAT_RGB888;
+		break;
+
+	case 32:
+		switch (depth) {
+		case 24:
+			fmt = DRM_FORMAT_XRGB8888;
+			break;
+		case 30:
+			fmt = DRM_FORMAT_XRGB2101010;
+			break;
+		case 32:
+			fmt = DRM_FORMAT_ARGB8888;
+			break;
+		default:
+			break;
+		}
+		break;
+
+	default:
+		break;
+	}
+
+	return fmt;
+}
+
 void modeset_create_fb_for_surface(int fd, _image* buf, modeset_display_surface* surface)
 {
-	int bpp = buf->format == VK_FORMAT_B8G8R8A8_UNORM ? 32 : 16;
-	int ret = drmModeAddFB(fd, buf->width, buf->height, bpp, bpp, buf->stride, buf->boundMem->bo, &buf->fb);
 
+
+	// int bpp = buf->format == VK_FORMAT_B8G8R8A8_UNORM ? 32 : 16;
+	// int ret = drmModeAddFB(fd, buf->width, buf->height, bpp, bpp, buf->stride, buf->boundMem->bo, &buf->fb);
+
+	uint32_t bpp = buf->format == VK_FORMAT_B8G8R8A8_UNORM ? 32 : 16;
+	uint32_t bo_handles[4] = {}, pitches[4] = {}, offsets[4] = {};
+
+	bo_handles[0] = buf->boundMem->bo;
+	pitches[0] = buf->stride;
+	int ret = drmModeAddFB2(fd, buf->width, buf->height, drm_mode_legacy_fb_format(bpp, bpp), bo_handles, pitches, offsets, &buf->fb, 0);
 	if(ret)
 	{
 		buf->fb = 0;
 		fprintf(stderr, "cannot create framebuffer (%d): %m\n", errno);
 	}
+
+	printf("-- %s %u\n", __func__, buf->fb);
 }
 
 void modeset_destroy_fb(int fd, _image* buf)
@@ -423,6 +888,68 @@ void modeset_acquire_image(int fd, _image** buf, modeset_display_surface** surfa
 		*surface = d.s;
 	}
 	sem_post(&flipQueueSem);
+}
+
+void modeset_present_atmoic(int fd, _image *buf, modeset_display_surface* surface, uint64_t seqno)
+{
+	if(!surface->savedState)
+	{
+		sem_wait(&savedStateSem);
+		{
+			for(uint32_t c = 0; c < 32; ++c)
+			{
+				if(!modeset_saved_states[c].used)
+				{
+					drmModeConnectorPtr tmpConnPtr = drmModeGetConnector(fd, surface->drm_atmoic.connector->connector->connector_id);
+					drmModeCrtcPtr tmpCrtcPtr = drmModeGetCrtc(fd, surface->drm_atmoic.crtc->crtc->crtc_id);
+					modeset_saved_states[c].used = 1;
+					modeset_saved_states[c].conn = tmpConnPtr;
+					modeset_saved_states[c].crtc = tmpCrtcPtr;
+					surface->savedState = c;
+					break;
+				}
+			}
+			surface->drm_atmoic.count = 0;
+		}
+		sem_post(&savedStateSem);
+	}
+
+	//TODO presenting needs to happen *after* the gpu is done with rendering to an image
+	//then immediate mode flips the page immediately, but fifo will post it for next vblank
+	//otherwise fifo would tear too
+	//so we should add images to the flip queue
+	//then wait for the first submitted (first out) seqno to finish
+	//then perform pageflip for that image
+	//
+	//drmModePageFlip(fd, surface->crtc->crtc_id, buf->fb, DRM_MODE_PAGE_FLIP_EVENT, first);
+	//drmModePageFlip(fd, surface->crtc->crtc_id, buf->fb, DRM_MODE_PAGE_FLIP_ASYNC, 0);
+
+	vsyncData d;
+
+	d.i = buf;
+	d.s = surface;
+	d.flipPending = 0;
+	d.seqno = seqno;
+
+	// printf("%s Send to %lu fifo\n", __func__, seqno);
+	// printf("%s: seqno = %lu\n", __func__, seqno);
+
+	uint32_t added = 0;
+
+	while(!added)
+	{
+		sem_wait(&flipQueueSem);
+		{
+			//try to add request to queue
+			added = fifoAdd(&flipQueueFifo, &d);
+		}
+
+		vsyncData* back = fifoGetFirst(&flipQueueFifo);
+
+		sem_post(&flipQueueSem);
+	}
+
+	//modeset_debug_print(fd);
 }
 
 void modeset_present(int fd, _image *buf, modeset_display_surface* surface, uint64_t seqno)

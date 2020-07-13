@@ -36,13 +36,13 @@ uint32_t fifoAdd(Fifo* f, void* data)
 	void* dataPtr = poolAllocate(&f->dataBuf);
 	FifoElem* elemPtr = poolAllocate(&f->fifoElemBuf);
 
-	memcpy(dataPtr, data, f->dataSize);
-	elemPtr->data = dataPtr;
-
 	if(!dataPtr || !elemPtr)
 	{
 		return 0;
 	}
+
+	memcpy(dataPtr, data, f->dataSize);
+	elemPtr->data = dataPtr;
 
 	if(!f->first)
 	{
@@ -125,7 +125,7 @@ void debugPrintFifo(Fifo* f)
 {
 	assert(f);
 
-	fprintf(stderr, "fifo debug print\n");
+	fprintf(stderr, "\nfifo debug print\n");
 	fprintf(stderr, "dataSize %u\n", f->dataSize);
 	fprintf(stderr, "maxElems %u\n", f->maxElems);
 

@@ -20,6 +20,47 @@ extern "C" {
 
 #include "common.h"
 
+#define DRM_ATOMIC_MODE_ENABLE	(1)
+
+struct plane {
+	drmModePlane *plane;
+	drmModeObjectProperties *props;
+	drmModePropertyRes **props_info;
+};
+
+struct crtc {
+	drmModeCrtc *crtc;
+	drmModeObjectProperties *props;
+	drmModePropertyRes **props_info;
+};
+
+struct connector {
+	drmModeConnector *connector;
+	drmModeObjectProperties *props;
+	drmModePropertyRes **props_info;
+};
+
+struct drm
+{
+	int fd;
+
+    /* only used for atomic: */
+    struct plane *plane;
+    struct crtc *crtc;
+    struct connector *connector;
+    int crtc_index;
+    int kms_in_fence_fd;
+    int kms_out_fence_fd;
+
+    drmModeModeInfo *mode;
+    uint32_t crtc_id;
+    uint32_t connector_id;
+	uint32_t plane_id;
+
+    /* number of frames to run for: */
+    unsigned int count;
+};
+
 typedef struct modeset_plane {
 	drmModePlanePtr plane;
 	uint32_t currentConnectorID;
@@ -45,7 +86,9 @@ typedef struct modeset_display_surface {
 	drmModeConnectorPtr connector;
 	drmModeCrtcPtr crtc;
 	uint32_t modeID;
+	uint32_t plane_id;
 	uint32_t savedState;
+	struct drm drm_atmoic;
 } modeset_display_surface;
 
 typedef struct modeset_saved_state {
@@ -54,13 +97,15 @@ typedef struct modeset_saved_state {
 	drmModeCrtcPtr crtc;
 } modeset_saved_state;
 
-modeset_saved_state modeset_saved_states[32];
+// static modeset_saved_state modeset_saved_states[32];
 
 void modeset_enum_displays(int fd, uint32_t* numDisplays, modeset_display* displays);
 void modeset_enum_modes_for_display(int fd, uint32_t display, uint32_t* numModes, modeset_display_mode* modes);
 void modeset_create_surface_for_mode(int fd, uint32_t display, uint32_t mode, modeset_display_surface* surface);
+void modeset_create_surface_for_atomic_mode(int fd, uint32_t display, uint32_t mode, modeset_display_surface* surface);
 void modeset_create_fb_for_surface(int fd, _image* buf, modeset_display_surface* surface);
 void modeset_destroy_fb(int fd, _image* buf);
+void modeset_present_atmoic(int fd, _image *buf, modeset_display_surface* surface, uint64_t seqno);
 void modeset_present(int fd, _image* buf, modeset_display_surface* surface, uint64_t seqno);
 void modeset_acquire_image(int fd, _image** buf, modeset_display_surface** surface);
 void modeset_destroy_surface(int fd, modeset_display_surface* surface);

@@ -121,9 +121,13 @@ VKAPI_ATTR VkResult VKAPI_CALL RPIFUNC(vkCreateDisplayPlaneSurfaceKHR)(
 	_displayMode mode;
 	memcpy(&mode, &pCreateInfo->displayMode, sizeof(_displayMode));
 
-	modeset_display_surface* surface = ALLOCATE(sizeof(modeset_display_surface), 1, VK_SYSTEM_ALLOCATION_SCOPE_INSTANCE);
-	modeset_create_surface_for_mode(controlFd, mode.connectorID, mode.modeID, surface);
 
+	modeset_display_surface* surface = ALLOCATE(sizeof(modeset_display_surface), 1, VK_SYSTEM_ALLOCATION_SCOPE_INSTANCE);
+#ifdef DRM_ATOMIC_MODE_ENABLE
+	modeset_create_surface_for_atomic_mode(controlFd, mode.connectorID, mode.modeID, surface);
+#else
+	modeset_create_surface_for_mode(controlFd, mode.connectorID, mode.modeID, surface);
+#endif
 	*pSurface = surface;
 
 	PROFILEEND(RPIFUNC(vkCreateDisplayPlaneSurfaceKHR));
@@ -179,8 +183,13 @@ VKAPI_ATTR VkResult VKAPI_CALL RPIFUNC(vkGetPhysicalDeviceSurfaceCapabilitiesKHR
 
 	modeset_display_surface* surf = surface;
 
+#ifdef DRM_ATOMIC_MODE_ENABLE
+	uint32_t width = surf->drm_atmoic.connector->connector->modes[surf->modeID].hdisplay;
+	uint32_t height = surf->drm_atmoic.connector->connector->modes[surf->modeID].vdisplay;
+#else
 	uint32_t width = surf->connector->modes[surf->modeID].hdisplay;
 	uint32_t height = surf->connector->modes[surf->modeID].vdisplay;
+#endif
 
 	pSurfaceCapabilities->minImageCount = 1;
 	pSurfaceCapabilities->maxImageCount = 2; //TODO max 2 for double buffering for now...
@@ -565,7 +574,11 @@ VKAPI_ATTR VkResult VKAPI_CALL RPIFUNC(vkQueuePresentKHR)(
 	for(uint32_t c = 0; c < pPresentInfo->swapchainCount; ++c)
 	{
 		_swapchain* s = pPresentInfo->pSwapchains[c];
+#ifdef DRM_ATOMIC_MODE_ENABLE
+		modeset_present_atmoic(controlFd, &s->images[pPresentInfo->pImageIndices[c]], s->surface, queue->lastEmitSeqno);
+#else
 		modeset_present(controlFd, &s->images[pPresentInfo->pImageIndices[c]], s->surface, queue->lastEmitSeqno);
+#endif
 		s->inFlight[pPresentInfo->pImageIndices[c]] = 1;
 	}
 
